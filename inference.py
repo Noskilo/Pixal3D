@@ -8,11 +8,19 @@ import cv2
 from PIL import Image
 
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ.setdefault("ATTN_BACKEND", "flash_attn")
+if torch.cuda.is_available():
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+_requested_device = os.environ.get("PIXAL3D_DEVICE", "auto")
+_xpu_auto = _requested_device == "auto" and not torch.cuda.is_available() and hasattr(torch, "xpu") and torch.xpu.is_available()
+_default_attn = "sdpa" if _requested_device.startswith("xpu") or _xpu_auto else "flash_attn"
+os.environ.setdefault("ATTN_BACKEND", _default_attn)
+if _requested_device.startswith("xpu") or _xpu_auto:
+    os.environ.setdefault("SPARSE_ATTN_BACKEND", os.environ["ATTN_BACKEND"])
+    os.environ.setdefault("SPARSE_CONV_BACKEND", "torch")
 os.environ["FLEX_GEMM_AUTOTUNE_CACHE_PATH"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'autotune_cache.json')
 os.environ["FLEX_GEMM_AUTOTUNER_VERBOSE"] = '1'
 
+from pixal3d.utils.device_utils import configure_runtime, empty_cache, manual_seed_all
 from pixal3d.pipelines import Pixal3DImageTo3DPipeline
 import o_voxel
 
@@ -72,6 +80,7 @@ def load_moge_model(device="cuda", model_name=MOGE_MODEL_NAME):
 
 
 def init_pipeline(model_path=MODEL_PATH, device="cuda", low_vram=False):
+    device = torch.device(device)
     print(f"[Pipeline] Loading from {model_path}...")
     pipeline = Pixal3DImageTo3DPipeline.from_pretrained(model_path)
 
@@ -90,17 +99,17 @@ def init_pipeline(model_path=MODEL_PATH, device="cuda", low_vram=False):
             m = getattr(pipeline, attr, None)
             if m is not None and getattr(m, 'use_naf_upsample', False):
                 m._load_naf()
-        pipeline._device = torch.device(device)
+        pipeline._device = device
         pipeline.low_vram = True
         print("[Pipeline] Low-VRAM mode enabled.")
     else:
         # Standard mode: all models loaded to GPU at once (faster, needs more VRAM).
         pipeline.low_vram = False
-        pipeline.cuda()
-        pipeline.image_cond_model_ss.cuda()
-        pipeline.image_cond_model_shape_512.cuda()
-        pipeline.image_cond_model_shape_1024.cuda()
-        pipeline.image_cond_model_tex_1024.cuda()
+        pipeline.to(device)
+        pipeline.image_cond_model_ss.to(device)
+        pipeline.image_cond_model_shape_512.to(device)
+        pipeline.image_cond_model_shape_1024.to(device)
+        pipeline.image_cond_model_tex_1024.to(device)
         print("[NAF] Pre-loading NAF upsampler model...")
         for attr in ['image_cond_model_ss', 'image_cond_model_shape_512',
                      'image_cond_model_shape_1024', 'image_cond_model_tex_1024']:
@@ -182,9 +191,12 @@ def run_inference(
     manual_fov: float = -1.0,
     low_vram: bool = False,
     resolution: int = -1,
+    device: str = None,
 ):
+    device = configure_runtime(device)
+    print(f"[Device] Using {device}")
     # Load models
-    pipeline = init_pipeline(model_path, low_vram=low_vram)
+    pipeline = init_pipeline(model_path, device=device, low_vram=low_vram)
 
     # Preprocess image first — rembg loads to GPU for this call, then offloads.
     # MoGe is loaded afterwards so both never occupy VRAM at the same time.
@@ -210,10 +222,10 @@ def run_inference(
         print(f"[Inference] Using manual FOV: {math.degrees(manual_fov):.2f}° ({manual_fov:.4f} rad), distance={distance:.4f}")
     else:
         print("[MoGe-2] Loading model for camera estimation...")
-        moge_model = load_moge_model(device="cuda")
+        moge_model = load_moge_model(device=device)
         print("[Inference] Estimating camera parameters...")
         camera_params = get_camera_params_wild_moge(
-            tmp_path, moge_model, device="cuda",
+            tmp_path, moge_model, device=device,
             mesh_scale=mesh_scale, extend_pixel=extend_pixel,
             image_resolution=image_resolution,
         )
@@ -221,12 +233,12 @@ def run_inference(
         # MoGe is only needed for camera estimation; free its VRAM for inference.
         moge_model.cpu()
         del moge_model
-        torch.cuda.empty_cache()
+        empty_cache(device)
     os.remove(tmp_path)
 
     # Run pipeline
     print("[Inference] Running 3D generation pipeline...")
-    torch.manual_seed(seed)
+    manual_seed_all(seed, device)
 
     ss_sampler_override = {
         "steps": ss_sampling_steps, "guidance_strength": ss_guidance_strength,
@@ -257,6 +269,8 @@ def run_inference(
     )
 
     mesh = mesh_list[0]
+    if torch.device(device).type != "cuda":
+        mesh = mesh.to("cpu")
 
     # Extract GLB
     print("[Inference] Extracting GLB...")
@@ -298,6 +312,8 @@ if __name__ == "__main__":
                              "Reduces peak VRAM from ~18GB to ~10-12GB at the cost of slower inference.")
     parser.add_argument("--resolution", type=int, default=-1,
                         help="Pipeline resolution (1024 or 1536). Default: 1024 if --low_vram, else 1536.")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Device to use: auto, cuda, xpu, or cpu. Can also be set with PIXAL3D_DEVICE.")
 
     args = parser.parse_args()
 
@@ -309,4 +325,5 @@ if __name__ == "__main__":
         model_path=args.model_path,
         low_vram=args.low_vram,
         resolution=args.resolution,
+        device=args.device,
     )

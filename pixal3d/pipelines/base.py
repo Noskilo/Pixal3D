@@ -64,9 +64,13 @@ class Pipeline:
     def to(self, device: torch.device) -> None:
         for model in self.models.values():
             model.to(device)
+        return self
 
     def cuda(self) -> None:
-        self.to(torch.device("cuda"))
+        return self.to(torch.device("cuda"))
+
+    def xpu(self) -> None:
+        return self.to(torch.device("xpu"))
 
     def cpu(self) -> None:
-        self.to(torch.device("cpu"))
+        return self.to(torch.device("cpu"))

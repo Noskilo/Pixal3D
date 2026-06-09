@@ -112,6 +112,21 @@ python inference.py --image assets/images/0_img.png --output ./output.glb --reso
 > ATTN_BACKEND=sdpa python inference.py --image assets/images/0_img.png --output ./output.glb --low_vram
 > ```
 
+#### Intel Arc / XPU Experimental Path
+
+PyTorch exposes Intel GPU support through the `xpu` device. Install an XPU-enabled PyTorch build for your platform, then run inference with SDPA attention and the portable sparse-conv fallback:
+
+```bash
+PIXAL3D_DEVICE=xpu ATTN_BACKEND=sdpa SPARSE_CONV_BACKEND=torch \
+python inference.py --image assets/images/0_img.png --output ./output.glb --low_vram --device xpu
+```
+
+Notes:
+- The XPU path is experimental and prioritizes compatibility over speed. The `torch` sparse-conv backend is a pure PyTorch fallback for submanifold sparse convolutions.
+- Install `pymeshlab` for CPU mesh cleanup/simplification fallback when `cumesh` cannot run: `pip install pymeshlab`.
+- CUDA-only native extensions are still used by parts of the project, including web preview rendering (`nvdiffrast`). GLB postprocessing may still require additional CPU/XPU replacements depending on your installed `o_voxel` stack.
+- If you force `--device xpu`, keep `ATTN_BACKEND=sdpa`; FlashAttention wheels are CUDA-oriented and are not the right backend for Intel Arc.
+
 ### Web Demo
 
 We provide a Gradio web demo for Pixal3D, which allows you to generate 3D meshes from images interactively.
@@ -295,4 +310,3 @@ If you find this work useful, please consider citing:
 ## 📜 License
 
 This project is released under the [MIT License](LICENSE). The third-party components included in this project remain licensed under their respective original terms; see [NOTICE](NOTICE) for the full list of dependencies and their licenses.
-

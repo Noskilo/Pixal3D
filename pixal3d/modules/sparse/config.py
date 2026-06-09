@@ -1,6 +1,6 @@
 from typing import *
 
-CONV = 'flex_gemm' 
+CONV = 'flex_gemm'
 DEBUG = False
 ATTN = 'flash_attn'
 
@@ -17,7 +17,7 @@ def __from_env():
     if env_sparse_attn_backend is None:
         env_sparse_attn_backend = os.environ.get('ATTN_BACKEND')
 
-    if env_sparse_conv_backend is not None and env_sparse_conv_backend in ['none', 'spconv', 'torchsparse', 'flex_gemm']:
+    if env_sparse_conv_backend is not None and env_sparse_conv_backend in ['none', 'spconv', 'torchsparse', 'flex_gemm', 'torch']:
         CONV = env_sparse_conv_backend
     if env_sparse_debug is not None:
         DEBUG = env_sparse_debug == '1'
@@ -30,7 +30,7 @@ def __from_env():
 __from_env()
     
 
-def set_conv_backend(backend: Literal['none', 'spconv', 'torchsparse', 'flex_gemm']):
+def set_conv_backend(backend: Literal['none', 'spconv', 'torchsparse', 'flex_gemm', 'torch']):
     global CONV
     CONV = backend
 

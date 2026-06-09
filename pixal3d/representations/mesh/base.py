@@ -1,8 +1,13 @@
 from typing import *
+import os
 import torch
 from ..voxel import Voxel
-import cumesh
 from flex_gemm.ops.grid_sample import grid_sample_3d
+
+try:
+    import cumesh
+except ImportError:
+    cumesh = None
 
 
 class Mesh:
@@ -31,8 +36,50 @@ class Mesh:
         
     def cpu(self):
         return self.to('cpu')
+
+    @staticmethod
+    def _load_pymeshlab():
+        try:
+            import pymeshlab
+        except ImportError as e:
+            raise ImportError(
+                "PyMeshLab is required for CPU/non-CUDA mesh processing. "
+                "Install it with `pip install pymeshlab`."
+            ) from e
+        return pymeshlab
+
+    def _to_pymeshlab(self):
+        pymeshlab = self._load_pymeshlab()
+        vertices = self.vertices.detach().cpu().numpy().astype('float64', copy=True)
+        faces = self.faces.detach().cpu().numpy().astype('int32', copy=True)
+        ms = pymeshlab.MeshSet()
+        ms.add_mesh(pymeshlab.Mesh(vertex_matrix=vertices, face_matrix=faces))
+        return ms
+
+    def _update_from_pymeshlab(self, ms):
+        mesh = ms.current_mesh()
+        device = self.device
+        self.vertices = torch.from_numpy(mesh.vertex_matrix().copy()).float().to(device)
+        self.faces = torch.from_numpy(mesh.face_matrix().copy()).int().to(device)
+
+    def _use_cumesh(self):
+        return cumesh is not None and self.device.type == 'cuda'
     
     def fill_holes(self, max_hole_perimeter=3e-2):
+        if not self._use_cumesh():
+            ms = self._to_pymeshlab()
+            max_hole_size = int(os.environ.get("PIXAL3D_PYMESHLAB_MAX_HOLE_SIZE", "30"))
+            if isinstance(max_hole_perimeter, int) and max_hole_perimeter > 0:
+                max_hole_size = max_hole_perimeter
+            ms.meshing_close_holes(
+                maxholesize=max_hole_size,
+                selected=False,
+                newfaceselected=False,
+                selfintersection=True,
+            )
+            self._update_from_pymeshlab(ms)
+            return
+
         vertices = self.vertices.clone().cuda().contiguous()
         faces = self.faces.clone().cuda().contiguous()
         
@@ -57,6 +104,17 @@ class Mesh:
         self.faces = new_faces.to(self.device)
         
     def remove_faces(self, face_mask: torch.Tensor):
+        if not self._use_cumesh():
+            keep = ~face_mask.detach().cpu().bool()
+            vertices = self.vertices.detach().cpu()
+            faces = self.faces.detach().cpu()[keep]
+            self.vertices = vertices.to(self.device)
+            self.faces = faces.to(self.device)
+            ms = self._to_pymeshlab()
+            ms.meshing_remove_unreferenced_vertices()
+            self._update_from_pymeshlab(ms)
+            return
+
         vertices = self.vertices.clone().cuda().contiguous()
         faces = self.faces.clone().cuda().contiguous()
         
@@ -69,6 +127,26 @@ class Mesh:
         self.faces = new_faces.to(self.device)
         
     def simplify(self, target=1000000, verbose: bool=False, options: dict={}):
+        if not self._use_cumesh():
+            if self.faces.shape[0] <= target:
+                return
+            ms = self._to_pymeshlab()
+            ms.meshing_decimation_quadric_edge_collapse(
+                targetfacenum=int(target),
+                targetperc=0,
+                qualitythr=float(options.get('qualitythr', 0.3)),
+                preserveboundary=bool(options.get('preserveboundary', False)),
+                boundaryweight=float(options.get('boundaryweight', 1.0)),
+                preservenormal=bool(options.get('preservenormal', True)),
+                preservetopology=bool(options.get('preservetopology', False)),
+                optimalplacement=bool(options.get('optimalplacement', True)),
+                planarquadric=bool(options.get('planarquadric', False)),
+                autoclean=True,
+                selected=False,
+            )
+            self._update_from_pymeshlab(ms)
+            return
+
         vertices = self.vertices.clone().cuda().contiguous()
         faces = self.faces.clone().cuda().contiguous()
         

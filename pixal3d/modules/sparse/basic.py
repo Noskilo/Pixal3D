@@ -150,6 +150,10 @@ class VarLenTensor:
         new_feats = self.feats.cuda()
         return self.replace(new_feats)
 
+    def xpu(self) -> 'VarLenTensor':
+        new_feats = self.feats.to('xpu')
+        return self.replace(new_feats)
+
     def half(self) -> 'VarLenTensor':
         new_feats = self.feats.half()
         return self.replace(new_feats)
@@ -613,6 +617,11 @@ class SparseTensor(VarLenTensor):
     def cuda(self) -> 'SparseTensor':
         new_feats = self.feats.cuda()
         new_coords = self.coords.cuda()
+        return self.replace(new_feats, new_coords)
+
+    def xpu(self) -> 'SparseTensor':
+        new_feats = self.feats.to('xpu')
+        new_coords = self.coords.to('xpu')
         return self.replace(new_feats, new_coords)
 
     def half(self) -> 'SparseTensor':

@@ -25,8 +25,15 @@ except ImportError:
 init_lock = threading.Lock()
 
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ.setdefault("ATTN_BACKEND", "flash_attn")
+if torch.cuda.is_available():
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+_requested_device = os.environ.get("PIXAL3D_DEVICE", "auto")
+_xpu_auto = _requested_device == "auto" and not torch.cuda.is_available() and hasattr(torch, "xpu") and torch.xpu.is_available()
+_default_attn = "sdpa" if _requested_device.startswith("xpu") or _xpu_auto else "flash_attn"
+os.environ.setdefault("ATTN_BACKEND", _default_attn)
+if _requested_device.startswith("xpu") or _xpu_auto:
+    os.environ.setdefault("SPARSE_ATTN_BACKEND", os.environ["ATTN_BACKEND"])
+    os.environ.setdefault("SPARSE_CONV_BACKEND", "torch")
 os.environ["FLEX_GEMM_AUTOTUNE_CACHE_PATH"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'autotune_cache.json')
 os.environ["FLEX_GEMM_AUTOTUNER_VERBOSE"] = '1'
 
@@ -36,6 +43,7 @@ from gradio.data_classes import FileData
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
+from pixal3d.utils.device_utils import configure_runtime, empty_cache
 from pixal3d.modules.sparse import SparseTensor
 from pixal3d.pipelines import Pixal3DImageTo3DPipeline
 from pixal3d.renderers import EnvMap
@@ -121,6 +129,7 @@ pipeline = None
 moge_model = None
 envmap = None
 LOW_VRAM = os.environ.get("LOW_VRAM", "0") == "1"
+DEVICE = configure_runtime(os.environ.get("PIXAL3D_DEVICE", "auto"))
 
 def init_models():
     global pipeline, moge_model, envmap
@@ -132,6 +141,7 @@ def init_models():
         import subprocess as _sp
         print("=" * 60)
         print("[Diagnostics] PyTorch version:", torch.__version__)
+        print("[Diagnostics] Device:", DEVICE)
         print("[Diagnostics] CUDA available:", torch.cuda.is_available())
         if torch.cuda.is_available():
             print("[Diagnostics] CUDA version:", torch.version.cuda)
@@ -141,6 +151,11 @@ def init_models():
                 cap = torch.cuda.get_device_capability(i)
                 mem = torch.cuda.get_device_properties(i).total_memory / 1024**3
                 print(f"[Diagnostics] GPU {i}: {name}, sm_{cap[0]}{cap[1]}, {mem:.1f} GB")
+        if hasattr(torch, "xpu"):
+            print("[Diagnostics] XPU available:", torch.xpu.is_available())
+            if torch.xpu.is_available():
+                for i in range(torch.xpu.device_count()):
+                    print(f"[Diagnostics] XPU {i}: {torch.xpu.get_device_name(i)}")
         try:
             res = _sp.run(["nvidia-smi", "--query-gpu=name,compute_cap,memory.total", "--format=csv,noheader"], capture_output=True, text=True, timeout=10)
             print("[Diagnostics] nvidia-smi:", res.stdout.strip())
@@ -166,17 +181,17 @@ def init_models():
                 m = getattr(pipeline, attr, None)
                 if m is not None and getattr(m, 'use_naf_upsample', False):
                     m._load_naf()
-            pipeline._device = torch.device("cuda")
+            pipeline._device = DEVICE
             pipeline.low_vram = True
             print("[Pipeline] Low-VRAM mode enabled.")
         else:
             # Standard mode: all models loaded to GPU at once.
             pipeline.low_vram = False
-            pipeline.cuda()
-            pipeline.image_cond_model_ss.cuda()
-            pipeline.image_cond_model_shape_512.cuda()
-            pipeline.image_cond_model_shape_1024.cuda()
-            pipeline.image_cond_model_tex_1024.cuda()
+            pipeline.to(DEVICE)
+            pipeline.image_cond_model_ss.to(DEVICE)
+            pipeline.image_cond_model_shape_512.to(DEVICE)
+            pipeline.image_cond_model_shape_1024.to(DEVICE)
+            pipeline.image_cond_model_tex_1024.to(DEVICE)
             print("[NAF] Pre-loading NAF upsampler model...")
             for attr in ['image_cond_model_ss', 'image_cond_model_shape_512',
                          'image_cond_model_shape_1024', 'image_cond_model_tex_1024']:
@@ -190,11 +205,11 @@ def init_models():
             moge_model = load_moge_model(device="cpu")
             print("[MoGe-2] Low-VRAM mode: MoGe stays on CPU, loaded to GPU on-demand.")
         else:
-            moge_model = load_moge_model(device="cuda")
+            moge_model = load_moge_model(device=DEVICE)
         
         print("[EnvMap] Loading environment maps...")
         _base = os.path.dirname(os.path.abspath(__file__))
-        _envmap_device = 'cpu' if LOW_VRAM else 'cuda'
+        _envmap_device = 'cpu' if LOW_VRAM else DEVICE
         envmap = {
             'forest': EnvMap(torch.tensor(cv2.cvtColor(cv2.imread(os.path.join(_base, 'assets/hdri/forest.exr'), cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB), dtype=torch.float32, device=_envmap_device)),
             'sunset': EnvMap(torch.tensor(cv2.cvtColor(cv2.imread(os.path.join(_base, 'assets/hdri/sunset.exr'), cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB), dtype=torch.float32, device=_envmap_device)),
@@ -222,7 +237,8 @@ def distance_from_fov(camera_angle_x, grid_point, target_point, mesh_scale, imag
     distance_x = f_pixels * xw / x_ndc - yw
     return {"distance_from_x": float(distance_x), "f_pixels": float(f_pixels)}
 
-def get_camera_params_wild_moge(image_path, device="cuda", mesh_scale=1.0, extend_pixel=0, image_resolution=512):
+def get_camera_params_wild_moge(image_path, device=None, mesh_scale=1.0, extend_pixel=0, image_resolution=512):
+    device = device or DEVICE
     pil_image = Image.open(image_path).convert("RGB")
     width, height = pil_image.size
     image_np = np.array(pil_image).astype(np.float32) / 255.0
@@ -233,7 +249,7 @@ def get_camera_params_wild_moge(image_path, device="cuda", mesh_scale=1.0, exten
         output = moge_model.infer(image_tensor)
     if LOW_VRAM:
         moge_model.cpu()
-        torch.cuda.empty_cache()
+        empty_cache(device)
     intrinsics = output["intrinsics"].squeeze().cpu().numpy()
     fx_normalized = intrinsics[0, 0]
     fx = fx_normalized * width
@@ -262,10 +278,10 @@ def pack_state(shape_slat, tex_slat, res):
 def unpack_state(state_path):
     data = np.load(state_path)
     shape_slat = SparseTensor(
-        feats=torch.from_numpy(data['shape_slat_feats']).cuda(),
-        coords=torch.from_numpy(data['coords']).cuda(),
+        feats=torch.from_numpy(data['shape_slat_feats']).to(DEVICE),
+        coords=torch.from_numpy(data['coords']).to(DEVICE),
     )
-    tex_slat = shape_slat.replace(torch.from_numpy(data['tex_slat_feats']).cuda())
+    tex_slat = shape_slat.replace(torch.from_numpy(data['tex_slat_feats']).to(DEVICE))
     return shape_slat, tex_slat, int(data['res'])
 
 # ============================================================================
@@ -431,7 +447,7 @@ def generate_3d(
         print(f"[Camera] Using manual FOV: {fov_deg:.2f}° ({camera_angle_x:.4f} rad), distance: {distance:.4f}")
     else:
         camera_params = get_camera_params_wild_moge(
-            temp_processed_path, device="cuda",
+            temp_processed_path, device=DEVICE,
             mesh_scale=WILD_MESH_SCALE, extend_pixel=WILD_EXTEND_PIXEL,
             image_resolution=WILD_IMAGE_RESOLUTION,
         )
@@ -460,6 +476,16 @@ def generate_3d(
     
     mesh = mesh_list[0]
     state_path = pack_state(shape_slat, tex_slat, res)
+
+    if DEVICE.type != "cuda":
+        _update_progress("Skipping CUDA-only preview rendering", 1, 1)
+        _finish_progress()
+        return {
+            "render_paths": {mode["render_key"]: [] for mode in MODES},
+            "state_path": os.path.abspath(state_path),
+            "camera_angle_x": camera_params['camera_angle_x'],
+            "distance": camera_params['distance'],
+        }
     
     _update_progress("Rendering views", 0, 1)
     mesh.simplify(16777216)
@@ -468,7 +494,7 @@ def generate_3d(
     far = cam_dist + 10.0
     if LOW_VRAM:
         for v in envmap.values():
-            v.image = v.image.cuda()
+            v.image = v.image.to(DEVICE)
             if hasattr(v, '_nvdiffrec_envlight'):
                 del v._nvdiffrec_envlight
     renders = render_utils.render_proj_aligned_video(
@@ -482,7 +508,7 @@ def generate_3d(
             if hasattr(v, '_nvdiffrec_envlight'):
                 del v._nvdiffrec_envlight
             v.image = v.image.cpu()
-        torch.cuda.empty_cache()
+        empty_cache(DEVICE)
     _update_progress("Rendering views", 1, 1)
     
     # Save renders and return paths
@@ -512,6 +538,8 @@ def extract_glb_api(state_path: str, decimation_target: int, texture_size: int, 
     
     shape_slat, tex_slat, res = unpack_state(state_path)
     mesh = pipeline.decode_latent(shape_slat, tex_slat, res)[0]
+    if DEVICE.type != "cuda":
+        mesh = mesh.to("cpu")
     _update_progress("Decoding latent", 1, 1)
     
     glb = o_voxel.postprocess.to_glb(
