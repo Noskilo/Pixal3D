@@ -48,7 +48,11 @@ from pixal3d.modules.sparse import SparseTensor
 from pixal3d.pipelines import Pixal3DImageTo3DPipeline
 from pixal3d.renderers import EnvMap
 from pixal3d.utils import render_utils
-import o_voxel
+
+try:
+    import o_voxel
+except ImportError:
+    o_voxel = None
 
 # ============================================================================
 # Constants & Defaults
@@ -284,6 +288,37 @@ def unpack_state(state_path):
     tex_slat = shape_slat.replace(torch.from_numpy(data['tex_slat_feats']).to(DEVICE))
     return shape_slat, tex_slat, int(data['res'])
 
+def export_mesh(mesh, output_path: str, res: int, decimation_target: int, texture_size: int):
+    if o_voxel is not None:
+        glb = o_voxel.postprocess.to_glb(
+            vertices=mesh.vertices, faces=mesh.faces, attr_volume=mesh.attrs,
+            coords=mesh.coords, attr_layout=pipeline.pbr_attr_layout,
+            grid_size=res, aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            decimation_target=decimation_target, texture_size=texture_size,
+            remesh=True, remesh_band=1, remesh_project=0, use_tqdm=True,
+        )
+    else:
+        print("[Export] o_voxel is not installed; exporting geometry-only GLB with trimesh.")
+        import trimesh
+        glb = trimesh.Trimesh(
+            vertices=mesh.vertices.detach().cpu().numpy(),
+            faces=mesh.faces.detach().cpu().numpy(),
+            process=False,
+        )
+
+    rot = np.array([
+        [-1,  0,  0,  0],
+        [ 0,  0, -1,  0],
+        [ 0, -1,  0,  0],
+        [ 0,  0,  0,  1],
+    ], dtype=np.float64)
+    glb.apply_transform(rot)
+
+    if o_voxel is not None:
+        glb.export(output_path, extension_webp=True)
+    else:
+        glb.export(output_path)
+
 # ============================================================================
 # Progress Tracking (file-based, cross-process safe for @spaces.GPU)
 # ============================================================================
@@ -352,8 +387,9 @@ import pixal3d.pipelines.samplers.flow_euler as _fe_module
 _fe_module.tqdm = _TqdmProgressInterceptor
 import pixal3d.utils.render_utils as _ru_module
 _ru_module.tqdm = _TqdmProgressInterceptor
-import o_voxel.postprocess as _ovp_module
-_ovp_module.tqdm = _TqdmProgressInterceptor
+if o_voxel is not None:
+    import o_voxel.postprocess as _ovp_module
+    _ovp_module.tqdm = _TqdmProgressInterceptor
 
 # ============================================================================
 # API Implementation
@@ -542,23 +578,8 @@ def extract_glb_api(state_path: str, decimation_target: int, texture_size: int, 
         mesh = mesh.to("cpu")
     _update_progress("Decoding latent", 1, 1)
     
-    glb = o_voxel.postprocess.to_glb(
-        vertices=mesh.vertices, faces=mesh.faces, attr_volume=mesh.attrs,
-        coords=mesh.coords, attr_layout=pipeline.pbr_attr_layout,
-        grid_size=res, aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target=decimation_target, texture_size=texture_size,
-        remesh=True, remesh_band=1, remesh_project=0, use_tqdm=True,
-    )
-    rot = np.array([
-        [-1,  0,  0,  0],
-        [ 0,  0, -1,  0],
-        [ 0, -1,  0,  0],
-        [ 0,  0,  0,  1],
-    ], dtype=np.float64)
-    glb.apply_transform(rot)
-    
     out_glb = os.path.join(TMP_DIR, f"result_{int(time.time()*1000)}.glb")
-    glb.export(out_glb, extension_webp=True)
+    export_mesh(mesh, out_glb, res, decimation_target, texture_size)
     _finish_progress()
     return FileData(path=out_glb)
 

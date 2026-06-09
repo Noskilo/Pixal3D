@@ -22,7 +22,11 @@ os.environ["FLEX_GEMM_AUTOTUNER_VERBOSE"] = '1'
 
 from pixal3d.utils.device_utils import configure_runtime, empty_cache, manual_seed_all
 from pixal3d.pipelines import Pixal3DImageTo3DPipeline
-import o_voxel
+
+try:
+    import o_voxel
+except ImportError:
+    o_voxel = None
 
 # ============================================================================
 # Constants & Defaults
@@ -163,6 +167,39 @@ def get_camera_params_wild_moge(image_path, moge_model, device="cuda", mesh_scal
     )["distance_from_x"]
     return {'camera_angle_x': camera_angle_x, 'distance': distance, 'mesh_scale': mesh_scale}
 
+
+def export_mesh(mesh, output_path: str, res: int, pipeline) -> None:
+    if o_voxel is not None:
+        glb = o_voxel.postprocess.to_glb(
+            vertices=mesh.vertices, faces=mesh.faces, attr_volume=mesh.attrs,
+            coords=mesh.coords, attr_layout=pipeline.pbr_attr_layout,
+            grid_size=res, aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            decimation_target=1000000, texture_size=4096,
+            remesh=True, remesh_band=1, remesh_project=0, use_tqdm=True,
+        )
+    else:
+        print("[Export] o_voxel is not installed; exporting geometry-only GLB with trimesh.")
+        import trimesh
+        glb = trimesh.Trimesh(
+            vertices=mesh.vertices.detach().cpu().numpy(),
+            faces=mesh.faces.detach().cpu().numpy(),
+            process=False,
+        )
+
+    rot = np.array([
+        [-1,  0,  0,  0],
+        [ 0,  0, -1,  0],
+        [ 0, -1,  0,  0],
+        [ 0,  0,  0,  1],
+    ], dtype=np.float64)
+    glb.apply_transform(rot)
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    if o_voxel is not None:
+        glb.export(output_path, extension_webp=True)
+    else:
+        glb.export(output_path)
+
 # ============================================================================
 # Main Inference
 # ============================================================================
@@ -274,26 +311,7 @@ def run_inference(
 
     # Extract GLB
     print("[Inference] Extracting GLB...")
-    glb = o_voxel.postprocess.to_glb(
-        vertices=mesh.vertices, faces=mesh.faces, attr_volume=mesh.attrs,
-        coords=mesh.coords, attr_layout=pipeline.pbr_attr_layout,
-        grid_size=res, aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target=1000000, texture_size=4096,
-        remesh=True, remesh_band=1, remesh_project=0, use_tqdm=True,
-    )
-
-    # Apply rotation
-    rot = np.array([
-        [-1,  0,  0,  0],
-        [ 0,  0, -1,  0],
-        [ 0, -1,  0,  0],
-        [ 0,  0,  0,  1],
-    ], dtype=np.float64)
-    glb.apply_transform(rot)
-
-    # Export
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    glb.export(output_path, extension_webp=True)
+    export_mesh(mesh, output_path, res, pipeline)
     print(f"[Done] GLB saved to: {output_path}")
 
 

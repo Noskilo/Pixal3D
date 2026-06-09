@@ -124,7 +124,8 @@ python inference.py --image assets/images/0_img.png --output ./output.glb --low_
 Notes:
 - The XPU path is experimental and prioritizes compatibility over speed. The `torch` sparse-conv backend is a pure PyTorch fallback for submanifold sparse convolutions.
 - Install `pymeshlab` for CPU mesh cleanup/simplification fallback when `cumesh` cannot run: `pip install pymeshlab`.
-- CUDA-only native extensions are still used by parts of the project, including web preview rendering (`nvdiffrast`). GLB postprocessing may still require additional CPU/XPU replacements depending on your installed `o_voxel` stack.
+- If `o_voxel` is unavailable, inference falls back to a geometry-only GLB export through `trimesh`; full PBR texture export still requires the original `o_voxel` postprocess stack.
+- CUDA-only native extensions are still used by parts of the project, including web preview rendering (`nvdiffrast`).
 - If you force `--device xpu`, keep `ATTN_BACKEND=sdpa`; FlashAttention wheels are CUDA-oriented and are not the right backend for Intel Arc.
 
 ### Web Demo
