@@ -2,12 +2,16 @@ from typing import *
 import os
 import torch
 from ..voxel import Voxel
-from flex_gemm.ops.grid_sample import grid_sample_3d
 
 try:
     import cumesh
 except ImportError:
     cumesh = None
+
+try:
+    from flex_gemm.ops.grid_sample import grid_sample_3d
+except ImportError:
+    grid_sample_3d = None
 
 
 class Mesh:
@@ -298,6 +302,11 @@ class MeshWithVoxel(Mesh, Voxel):
         )
         
     def query_attrs(self, xyz):
+        if grid_sample_3d is None:
+            raise ImportError(
+                "MeshWithVoxel.query_attrs requires flex_gemm.ops.grid_sample. "
+                "Install flex_gemm or add a CPU/XPU grid_sample_3d fallback before calling this method."
+            )
         grid = ((xyz - self.origin) / self.voxel_size).reshape(1, -1, 3)
         vertex_attrs = grid_sample_3d(
             self.attrs,
